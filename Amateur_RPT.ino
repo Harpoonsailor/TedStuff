@@ -1,109 +1,62 @@
 
-// ============================================================
-// ARDUINO UNO GMRS REPEATER CONTROLLER
-// RUS / PTT / MORSE IDENTIFIER
-// ============================================================
-//
-// RUS INPUT:
-//   D9 LOW  = RUS ACTIVE
-//   D9 HIGH = NO RUS
-//
-// RUS ACTIVATION QUALIFICATION:
-//   LOW continuously for 75 ms
-//
-// RUS LOSS QUALIFICATION:
-//   HIGH continuously for MORE THAN 300 ms
-//
-// PTT:
-//   D8 = PTT output
-//
-// STATUS LEDs:
-//   D4 = POWER LED
-//   D5 = PTT LED
-//   D6 = ID LED
-//   D7 = RUS / COR LED
-//
-// MAXIMUM CONTINUOUS RUS PTT:
-//   3 minutes
-//
-// SHORT RUS DROPOUTS:
-//   300 ms or less do not reset transmit timer
-//
-// LOCKOUT:
-//   20 seconds
-//   Followed by 3-second PTT burst
-//
-// CW IDENTIFICATION:
-//   Identifier: _____   Default for distribution = N0NE. Enter yours on Line 106
-//   Frequency: approximately 490.2 Hz
-//   Output: D11 (Timer2 OC2A)
-//
-// ID SCHEDULING:
-//   Startup ID: 4 seconds
-//   Normal ID interval: ~9.4 minutes
-//   No-RUS ID interval: 39 minutes after initial 19-minute quiet (no RUS) period.
-//   PTT lead: 400 ms
-//
-// RUS IDENTIFICATION WINDOW:
-//   19 minutes since last actual qualified RUS
-//
-// ============================================================
-
 #include <string.h>
 
 // ============================================================
-// PIN ASSIGNMENTS
+// ARDUINO UNO AMATEUR RADIO REPEATER CONTROLLER
+// RUS / PTT / MORSE IDENTIFIER
 // ============================================================
+// ENTER YOUR CALL SIGN WITHIN THE CODE IN LINE 57, default = "YOUR/CALL"
+
+// PIN ASSIGNMENTS
 
 const byte RUS_PIN = 9;
-
 const byte POWER_LED = 4;
-const byte PTT_LED   = 5;
-const byte ID_LED    = 6;
-const byte RUS_LED   = 7;
-
-const byte PTT_PIN   = 8;
+const byte PTT_LED = 5;
+const byte ID_LED = 6;
+const byte RUS_LED = 7;
+const byte PTT_PIN = 8;
 const byte MORSE_PIN = 11;
 
-// ============================================================
 // TIMING
-// ============================================================
 
-const unsigned long MAX_RUS_PTT = 178200UL;
+const unsigned long MAX_RUS_PTT = 59400UL;   // Rptr Timeout, max TX length in one user transmission. Ensure the TX radio TOT is no shorter than this entry.
+const unsigned long WARNING_TIME = 56000UL;  // About 4 seconds less than MAX RUS PTT for warning beeps upon Timeout
+const unsigned long PTT_HOLD = 700UL;        // Squench Tail
+const unsigned long PTT_LOCKOUT = 15000UL;   // Time off-air due to Timeout 
 
-const unsigned long PTT_HOLD = 2000UL;
-const unsigned long PTT_LOCKOUT = 20000UL;
+const unsigned long RUS_ACTIVE_QUALIFY = 75UL;     // Prevents staticy signal from resetting RUS TOT
+const unsigned long RUS_LOSS_QUALIFY = 300UL;      // Time required for TOT reset.
+const unsigned long ID_RUS_TIMEOUT = 1,020,000UL;  // After this period, ID is every ID_NO_RUS_INTERVAL time apart until someone starts using the repeater again. 
 
-const unsigned long RUS_ACTIVE_QUALIFY = 75UL;
-const unsigned long RUS_LOSS_QUALIFY = 300UL;
+const unsigned long TIMEOUT_LED_INTERVAL = 200UL;  
 
-const unsigned long ID_RUS_TIMEOUT = 1140000UL;
+const unsigned long ID_INTERVAL = 480,000UL;  // ID interval as long as repeater is active at least every ID_RUS_TIMEOUT value
+const unsigned long ID_NO_RUS_INTERVAL = 2,340,000UL; // Standby ID interval when repeater is dormant for ID_RUS_TIMEOUT period
 
-const unsigned long TIMEOUT_LED_INTERVAL = 200UL;
+const unsigned long ID_PTT_LEAD = 500UL;        // Time between PTT active and an ID transmission, when it's time to ID
+const unsigned long STARTUP_ID_DELAY = 5000UL;  // First ID after repeater power-on
+const unsigned long ID_FLASH_INTERVAL = 10UL;
 
-const unsigned long LOCKOUT_PTT_TIME = 3000UL;
+const unsigned long LOCKOUT_CW_LEAD = 2200UL;  Delay after PTT & message, for ID upon recovery after a Timeout
+const unsigned long LOCKOUT_FOLLOWUP_DELAY = 200UL;  // Delay after Timeout restoration for short message
 
-const unsigned long ID_INTERVAL = 564000UL;
+// TIMER2 FREQUENCY SETTINGS
 
-const unsigned long ID_NO_RUS_INTERVAL = 2340000UL;
+const byte CW_NORMAL_TOP = 255;    // Freq setting for CW ID
+const byte CW_WARNING_TOP = 124;   // Freq setting for CW Timeout warning chirps
 
-const unsigned long ID_PTT_LEAD = 400UL;
-const unsigned long STARTUP_ID_DELAY = 4000UL;
+// MORSE TIMING
 
-const unsigned long ID_FLASH_INTERVAL = 167UL;
+const unsigned long DOT_TIME = 58UL;    // Length of a Morse Code "dit"
+const unsigned long DASH_TIME = 170UL;  //  Should equal 3 x DOT_TIME
+const unsigned long ELEMENT_GAP = 58UL;  // Should equal DOT_TIME
+const unsigned long LETTER_GAP = 170UL;   // Should equal 3 x DOT_TIME
 
-const byte CW_TIMER_TOP = 255; // 0-255, where a lower value is higher audio freq, vice versa
+// CW IDENTIFIERS
 
-const unsigned long DOT_TIME    = 60UL;
-const unsigned long DASH_TIME   = 180UL;
-const unsigned long ELEMENT_GAP = 65UL;
-const unsigned long LETTER_GAP  = 190UL;
-
-// ============================================================
-// IDENTIFIER
-// ============================================================
-
-const char IDENTIFIER[] = "N0NE/R";
+const char IDENTIFIER[] = "YOUR/CALL";
+const char WARNING_IDENTIFIER[] = "IIIIIII";
+const char LOCKOUT_IDENTIFIER[] = "TIME";
 
 // ============================================================
 // RUS STATE
@@ -125,23 +78,33 @@ bool pttLockedOut = false;
 unsigned long rusStartTime = 0;
 unsigned long rusLossTime = 0;
 unsigned long pttLockoutStart = 0;
-
 unsigned long lastActualRusTime = 0;
+
 bool rusIdWindowActive = false;
+bool warningSent = false;
+bool dormantIdMode = false;
 
 // ============================================================
-// TIMEOUT LED ROTATION STATE
+// TIMEOUT LED STATE
 // ============================================================
 
 byte timeoutLedStep = 0;
 unsigned long timeoutLedTime = 0;
 
 // ============================================================
-// END-OF-LOCKOUT PTT/CW BURST
+// LOCKOUT PTT / CW STATE
 // ============================================================
 
 bool lockoutPttPulseActive = false;
 unsigned long lockoutPttPulseStart = 0;
+
+bool lockoutFollowupPending = false;
+bool lockoutFollowupActive = false;
+unsigned long lockoutFollowupStart = 0;
+
+bool lockoutCwPending = false;
+unsigned long lockoutCwStart = 0;
+bool lockoutCwComplete = false;
 
 // ============================================================
 // IDENTIFICATION STATE
@@ -171,22 +134,8 @@ byte morseElement = 0;
 bool morseToneActive = false;
 unsigned long morseStateTime = 0;
 
-// ============================================================
-// FUNCTION PROTOTYPES
-// ============================================================
-
-void setupCwTimer();
-void setCwCarrier(bool enabled);
-
-void updateRusInput();
-
-void startIdentifier();
-void startMorseElement();
-void updateMorse();
-
-void updateIdLed();
-void updateTimeoutLeds();
-void updatePttOutput();
+bool lockoutMorseMode = false;
+bool warningMorseMode = false;
 
 // ============================================================
 // MORSE LOOKUP
@@ -222,7 +171,6 @@ const char* getMorse(char c)
     case 'X': return "-..-";
     case 'Y': return "-.--";
     case 'Z': return "--..";
-
     case '0': return "-----";
     case '1': return ".----";
     case '2': return "..---";
@@ -234,13 +182,12 @@ const char* getMorse(char c)
     case '8': return "---..";
     case '9': return "----.";
     case '/': return "-..-.";
-
     default: return "";
   }
 }
 
 // ============================================================
-// SET UP TIMER2 HARDWARE CW GENERATOR
+// TIMER2 CW GENERATOR
 // ============================================================
 
 void setupCwTimer()
@@ -249,11 +196,9 @@ void setupCwTimer()
   TCCR2B = 0;
 
   TCNT2 = 0;
-
-  OCR2A = CW_TIMER_TOP;
+  OCR2A = CW_NORMAL_TOP;
 
   TCCR2A |= _BV(COM2A0);
-
   TCCR2A |= _BV(WGM20);
   TCCR2B |= _BV(WGM22);
 
@@ -269,7 +214,7 @@ void setupCwTimer()
 }
 
 // ============================================================
-// ENABLE / DISABLE CW CARRIER
+// CW CARRIER CONTROL
 // ============================================================
 
 void setCwCarrier(bool enabled)
@@ -277,6 +222,11 @@ void setCwCarrier(bool enabled)
   if (enabled)
   {
     TCNT2 = 0;
+
+    if (warningMorseMode)
+      OCR2A = CW_WARNING_TOP;
+    else
+      OCR2A = CW_NORMAL_TOP;
 
     TCCR2A &= ~_BV(COM2A1);
     TCCR2A |= _BV(COM2A0);
@@ -291,17 +241,13 @@ void setCwCarrier(bool enabled)
 }
 
 // ============================================================
-// UPDATE / QUALIFY RUS INPUT
+// RUS INPUT QUALIFICATION
 // ============================================================
 
 void updateRusInput()
 {
   unsigned long now = millis();
-
   bool rawRus = (digitalRead(RUS_PIN) == LOW);
-
-  // RUS ACTIVE:
-  // Must remain active for 75 ms.
 
   if (rawRus)
   {
@@ -321,16 +267,12 @@ void updateRusInput()
     if (now - rusActiveCandidateStart >= RUS_ACTIVE_QUALIFY)
     {
       rus = true;
-
       rusActivePending = false;
       rusActiveCandidateStart = 0;
     }
 
     return;
   }
-
-  // RUS INACTIVE:
-  // Must remain inactive MORE THAN 300 ms.
 
   rusActivePending = false;
   rusActiveCandidateStart = 0;
@@ -348,26 +290,21 @@ void updateRusInput()
   if (now - rusLossCandidateStart > RUS_LOSS_QUALIFY)
   {
     rus = false;
-
     rusLossPending = false;
     rusLossCandidateStart = 0;
-
-    // Genuine RUS loss permits a new
-    // transmit-time cycle.
-
     pttTimedOut = false;
   }
 }
 
 // ============================================================
-// UPDATE ID LED
+// ID LED
 // ============================================================
 
 void updateIdLed()
 {
   unsigned long now = millis();
 
-  if (idActive)
+  if (idActive || lockoutCwPending)
   {
     digitalWrite(ID_LED, HIGH);
     return;
@@ -390,7 +327,7 @@ void updateIdLed()
 }
 
 // ============================================================
-// UPDATE TIMEOUT LED ROTATION
+// TIMEOUT LED ROTATION
 // ============================================================
 
 void updateTimeoutLeds()
@@ -403,7 +340,6 @@ void updateTimeoutLeds()
   if (now - timeoutLedTime >= TIMEOUT_LED_INTERVAL)
   {
     timeoutLedTime = now;
-
     timeoutLedStep++;
 
     if (timeoutLedStep >= 3)
@@ -411,25 +347,20 @@ void updateTimeoutLeds()
   }
 
   digitalWrite(PTT_LED, LOW);
-  digitalWrite(RUS_LED, LOW);
   digitalWrite(POWER_LED, LOW);
-
-  if (timeoutLedStep == 0)
-  {
+  digitalWrite(RUS_LED, LOW);
+   
+    if (timeoutLedStep == 0)
     digitalWrite(PTT_LED, HIGH);
-  }
   else if (timeoutLedStep == 1)
-  {
     digitalWrite(RUS_LED, HIGH);
-  }
   else
-  {
     digitalWrite(POWER_LED, HIGH);
-  }
+    
 }
 
 // ============================================================
-// START IDENTIFICATION
+// START NORMAL IDENTIFICATION
 // ============================================================
 
 void startIdentifier()
@@ -437,17 +368,13 @@ void startIdentifier()
   if (idActive)
     return;
 
-  if (!rusIdWindowActive &&
-      rus &&
-      !lockoutPttPulseActive)
-    return;
-
   idPending = false;
-
   idFlashState = false;
   idFlashTime = millis();
 
   idActive = true;
+  lockoutMorseMode = false;
+  warningMorseMode = false;
 
   morseChar = 0;
   morseElement = 0;
@@ -456,9 +383,58 @@ void startIdentifier()
   digitalWrite(PTT_PIN, HIGH);
 
   idPttLeadActive = true;
-
   idPttLeadStart = millis();
   morseStateTime = idPttLeadStart;
+}
+
+// ============================================================
+// START WARNING: SEVEN LETTER I CHARACTERS
+// ============================================================
+
+void startWarningIdentifier()
+{
+  if (idActive)
+    return;
+
+  idActive = true;
+  warningMorseMode = true;
+  lockoutMorseMode = false;
+
+  morseChar = 0;
+  morseElement = 0;
+  morseToneActive = false;
+
+  idPttLeadActive = false;
+
+  digitalWrite(PTT_PIN, HIGH);
+}
+
+// ============================================================
+// START LOCKOUT IDENTIFICATION: TIME
+// ============================================================
+
+void startLockoutIdentifier()
+{
+  if (idActive)
+    return;
+
+  idActive = true;
+
+  lockoutMorseMode = true;
+  warningMorseMode = false;
+
+  morseChar = 0;
+  morseElement = 0;
+
+  morseToneActive = false;
+  idPttLeadActive = false;
+
+  lockoutCwPending = false;
+
+  setCwCarrier(false);
+  digitalWrite(PTT_PIN, HIGH);
+
+  startMorseElement();
 }
 
 // ============================================================
@@ -490,28 +466,30 @@ void updateMorse()
       return;
 
     idPttLeadActive = false;
-
     startMorseElement();
     return;
   }
 
-  const char* code = getMorse(IDENTIFIER[morseChar]);
+  const char* message;
 
+  if (warningMorseMode)
+    message = WARNING_IDENTIFIER;
+  else if (lockoutMorseMode)
+    message = LOCKOUT_IDENTIFIER;
+  else
+    message = IDENTIFIER;
+
+  const char* code = getMorse(message[morseChar]);
   char element = code[morseElement];
 
-  unsigned long duration;
-
-  if (element == '.')
-    duration = DOT_TIME;
-  else
-    duration = DASH_TIME;
+  unsigned long duration =
+    (element == '.') ? DOT_TIME : DASH_TIME;
 
   if (morseToneActive)
   {
     if (now - morseStateTime >= duration)
     {
       setCwCarrier(false);
-
       morseToneActive = false;
       morseStateTime = now;
     }
@@ -519,12 +497,9 @@ void updateMorse()
     return;
   }
 
-  unsigned long gap;
-
-  if (morseElement < strlen(code) - 1)
-    gap = ELEMENT_GAP;
-  else
-    gap = LETTER_GAP;
+  unsigned long gap =
+    (morseElement < strlen(code) - 1)
+    ? ELEMENT_GAP : LETTER_GAP;
 
   if (now - morseStateTime < gap)
     return;
@@ -532,44 +507,48 @@ void updateMorse()
   if (morseElement < strlen(code) - 1)
   {
     morseElement++;
-
     startMorseElement();
     return;
   }
 
   morseChar++;
 
-  if (morseChar >= strlen(IDENTIFIER))
+  if (morseChar >= strlen(message))
   {
     setCwCarrier(false);
 
     idActive = false;
     idPttLeadActive = false;
 
-    nextIdDue = now +
-      (rusIdWindowActive ? ID_INTERVAL : ID_NO_RUS_INTERVAL);
+    if (warningMorseMode)
+    {
+      warningMorseMode = false;
+    }
+    else if (lockoutMorseMode)
+    {
+      lockoutMorseMode = false;
+      lockoutCwComplete = true;
+    }
+    else
+    {
+      nextIdDue = now +
+        (dormantIdMode ? ID_NO_RUS_INTERVAL : ID_INTERVAL);
+    }
 
     return;
   }
 
   morseElement = 0;
-
   startMorseElement();
 }
 
 // ============================================================
-// UPDATE PTT OUTPUT
+// PTT OUTPUT
 // ============================================================
 
 void updatePttOutput()
 {
-  if (lockoutPttPulseActive)
-  {
-    digitalWrite(PTT_PIN, HIGH);
-    return;
-  }
-
-  if (idActive)
+  if (lockoutPttPulseActive || idActive)
   {
     digitalWrite(PTT_PIN, HIGH);
     return;
@@ -584,6 +563,7 @@ void updatePttOutput()
   digitalWrite(PTT_PIN, LOW);
 }
 
+
 // ============================================================
 // SETUP
 // ============================================================
@@ -591,7 +571,6 @@ void updatePttOutput()
 void setup()
 {
   pinMode(RUS_PIN, INPUT);
-
   pinMode(PTT_PIN, OUTPUT);
   pinMode(MORSE_PIN, OUTPUT);
 
@@ -611,10 +590,6 @@ void setup()
   setupCwTimer();
 
   startupTime = millis();
-
-  // Schedule first normal ID after startup ID interval.
-  // Prevents duplicate identification at power-up.
-
   nextIdDue = startupTime + ID_INTERVAL;
 }
 
@@ -629,9 +604,7 @@ void loop()
   updateRusInput();
 
   if (!pttLockedOut)
-  {
     digitalWrite(RUS_LED, rus ? HIGH : LOW);
-  }
 
   // NEW QUALIFIED RUS
 
@@ -640,15 +613,25 @@ void loop()
     lastActualRusTime = now;
     rusIdWindowActive = true;
 
-    nextIdDue = now + ID_INTERVAL;
+    if (dormantIdMode)
+    {
+      dormantIdMode = false;
+      nextIdDue = now + ID_INTERVAL;
+
+      if (!idActive &&
+          !pttLockedOut &&
+          !lockoutPttPulseActive)
+      {
+        startIdentifier();
+      }
+    }
 
     if (!pttLockedOut && !lockoutPttPulseActive)
     {
       rusStartTime = now;
-
       rusPttActive = true;
       pttTimedOut = false;
-
+      warningSent = false;
       rusLossTime = 0;
     }
   }
@@ -659,13 +642,25 @@ void loop()
   {
     lastActualRusTime = now;
 
+    // WARNING
+
+    if (rusPttActive &&
+        !pttTimedOut &&
+        !warningSent &&
+        now - rusStartTime >= WARNING_TIME)
+    {
+      warningSent = true;
+      startWarningIdentifier();
+    }
+
+    // MAXIMUM PTT TIME
+
     if (rusPttActive &&
         !pttTimedOut &&
         now - rusStartTime >= MAX_RUS_PTT)
     {
       rusPttActive = false;
       pttTimedOut = true;
-
       pttLockedOut = true;
       pttLockoutStart = now;
 
@@ -708,40 +703,30 @@ void loop()
       now - startupTime >= STARTUP_ID_DELAY)
   {
     startupIdPending = false;
-
     lastActualRusTime = now;
     rusIdWindowActive = true;
-
     startIdentifier();
   }
 
-  // NORMAL / ALTERNATE ID SCHEDULING
+  // NORMAL / DORMANT ID SCHEDULING
 
-  if (!idActive &&
+  // Suppress scheduled IDs during lockout recovery.
+
+  if (!lockoutPttPulseActive &&
+      !idActive &&
       !idPending &&
       (long)(now - nextIdDue) >= 0 &&
       (rusIdWindowActive || !rus))
   {
     idPending = true;
-
     idFlashTime = now;
     idFlashState = true;
 
     if (!rus)
-    {
       startIdentifier();
-    }
   }
 
-  // UPDATE MORSE
-
-  updateMorse();
-
-  // UPDATE ID LED
-
-  updateIdLed();
-
-  // 28.2-MINUTE NO-RUS IDENTIFICATION TIMEOUT
+  // 28.2-MINUTE NO-RUS TIMEOUT
 
   if (rusIdWindowActive &&
       !rus &&
@@ -749,16 +734,16 @@ void loop()
       now - lastActualRusTime >= ID_RUS_TIMEOUT)
   {
     rusIdWindowActive = false;
+    dormantIdMode = true;
 
     idPending = false;
     idFlashState = false;
 
     nextIdDue = now + ID_NO_RUS_INTERVAL;
-
     digitalWrite(ID_LED, LOW);
   }
 
-  // 20-SECOND PTT LOCKOUT
+  // PTT LOCKOUT
 
   if (pttLockedOut)
   {
@@ -769,10 +754,14 @@ void loop()
       lockoutPttPulseActive = true;
       lockoutPttPulseStart = now;
 
-      if (rusIdWindowActive && !idActive)
-      {
-        startIdentifier();
-      }
+      lockoutCwPending = true;
+      lockoutCwStart = now;
+      lockoutCwComplete = false;
+
+      lockoutFollowupPending = false;
+      lockoutFollowupActive = false;
+
+      digitalWrite(PTT_PIN, HIGH);
     }
     else
     {
@@ -780,25 +769,72 @@ void loop()
     }
   }
 
-  // END-OF-LOCKOUT PTT BURST
+  // WAIT BEFORE TRANSMITTING TIME
+
+  if (lockoutCwPending &&
+      !idActive &&
+      now - lockoutCwStart >= LOCKOUT_CW_LEAD)
+  {
+    startLockoutIdentifier();
+  }
+
+  // ==========================================================
+  // LOCKOUT RECOVERY FOLLOW-UP SEQUENCE
+  // ==========================================================
 
   if (lockoutPttPulseActive)
   {
+    // Keep transmitter keyed throughout recovery.
+
     digitalWrite(PTT_PIN, HIGH);
 
-    if (now - lockoutPttPulseStart >= LOCKOUT_PTT_TIME)
+    // TIME transmission has finished.
+
+    if (lockoutCwComplete)
     {
+      lockoutCwComplete = false;
+
+      // Begin the one-second follow-up delay.
+
+      lockoutFollowupPending = true;
+      lockoutFollowupStart = now;
+    }
+
+    // Wait one second after TIME before station ID.
+
+    if (lockoutFollowupPending &&
+        now - lockoutFollowupStart >=
+        LOCKOUT_FOLLOWUP_DELAY)
+    {
+      lockoutFollowupPending = false;
+      lockoutFollowupActive = true;
+
+      // Start normal station identification
+
+      startIdentifier();
+    }
+
+    // Release PTT only after identification has finished.
+
+    if (lockoutFollowupActive && !idActive)
+    {
+      lockoutFollowupActive = false;
       lockoutPttPulseActive = false;
 
-      if (!idActive)
-      {
-        digitalWrite(PTT_PIN, LOW);
-      }
+      digitalWrite(PTT_PIN, LOW);
 
       digitalWrite(POWER_LED, HIGH);
       digitalWrite(RUS_LED, rus ? HIGH : LOW);
     }
   }
+
+  // UPDATE MORSE
+
+  updateMorse();
+
+  // UPDATE ID LED
+
+  updateIdLed();
 
   // UPDATE PTT
 
